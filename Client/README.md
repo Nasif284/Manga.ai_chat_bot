@@ -1,191 +1,173 @@
-# Manga.ai Web Client
+# Manga.ai — Frontend Client (`Client/`)
 
-A modern, high-performance conversational AI interface built with **React 19**, **Vite 7**, **TanStack Query v5**, **Google Gen AI SDK v1.20 (`gemini-2.5-flash`)**, and **Clerk Identity**. Engineered for real-time token streaming, zero-latency multimodal media pipelines, and robust declarative server-state synchronization.
+React frontend for **Manga.ai**, built with **React 19**, **Vite 7**, **TanStack Query v5**, **React Router v7**, **Clerk Auth**, and the **Google Gen AI SDK (`@google/genai`)**. It supports multi-turn conversations with `gemini-2.5-flash`, real-time streamed Markdown responses, and image uploads for multimodal prompts.
 
 ---
 
-## 🏗️ Client Architecture & Information Flow
-
-The frontend coordinates asynchronous token streaming directly from generative foundation models while decoupling server-side persistence through transactional REST mutations.
+## 🏗️ Client Architecture & Data Flow
 
 ```mermaid
 flowchart TD
-    subgraph BrowserContext ["Browser Context (React 19 SPA)"]
-        UI["Interactive Viewport\nChatPage / Dashboard"]
-        
-        subgraph MediaPipeline ["Multimodal Handler"]
-            FileIn["Image Input"]
-            BlobPreview["Instant Blob URI\nURL.createObjectURL"]
-            Base64Worker["Base64 Inline Encoder\nFileReader API"]
+    subgraph ReactApp ["React 19 Application"]
+        Dashboard["Dashboard (/dashboard)\nCreates new chat thread"]
+        ChatPage["ChatPage (/chat/:id)\nLoads conversation history"]
+        PromptInput["PromptInput Component\nHandles streaming & image input"]
+
+        subgraph ImageHandling ["Image Upload Flow"]
+            LocalPreview["Local Preview\nURL.createObjectURL(file)"]
+            Base64Reader["Base64 Conversion\nFileReader.readAsDataURL"]
         end
 
-        subgraph AIRuntime ["AI Inference Runtime"]
-            GenAISDK["Google Gen AI SDK (@google/genai)"]
-            ChatSession["Multi-Turn Chat Context\nai.chats.create"]
-            StreamConsumer["Async Chunk Iterator\nfor await...of"]
-        end
-
-        subgraph StateCacheEngine ["State & Cache Engine (TanStack Query v5)"]
-            QueryCache[("(Server State Cache)")]
-            MutationSync["Atomic Sync Mutations\nuseMutation"]
+        subgraph StateAndAI ["State & AI SDK"]
+            ReactQuery["TanStack Query\n(useQuery / useMutation)"]
+            GeminiSDK["Google Gen AI SDK\n(gemini-2.5-flash)"]
         end
     end
 
-    subgraph ExternalCloud ["External Cloud Services"]
-        Gemini["Google Gemini 2.5 Flash API"]
-        BackendAPI["Express REST API :8000"]
-        ClerkAuth["Clerk Identity Provider"]
-        CloudinaryCDN["Cloudinary Media CDN"]
+    subgraph External ["External Services"]
+        Clerk["Clerk Auth"]
+        ExpressAPI["Express Backend (:8000)"]
+        Cloudinary["Cloudinary CDN"]
+        GeminiAPI["Google Gemini API"]
     end
 
-    UI -->|"User Session Check"| ClerkAuth
-    FileIn --> BlobPreview --> UI
-    FileIn --> Base64Worker -->|"inlineData payload"| GenAISDK
-    FileIn -->|"multipart/form-data"| BackendAPI --> CloudinaryCDN
+    Dashboard -->|"POST /api/chat/new"| ExpressAPI
+    ExpressAPI -->|"Returns new chat ID"| ChatPage
+    ChatPage -->|"GET /api/chat/:id"| ReactQuery
 
-    UI -->|"Trigger Prompt"| ChatSession
-    ChatSession -->|"Stream Request"| Gemini
-    Gemini -->|"Streamed Chunks"| StreamConsumer
-    StreamConsumer -->|"Progressive State Update"| UI
+    PromptInput -->|"1. Instant preview"| LocalPreview
+    PromptInput -->|"2. Encode for Gemini"| Base64Reader
+    PromptInput -->|"3. POST /api/image"| ExpressAPI --> Cloudinary
 
-    StreamConsumer -->|"On Stream End"| MutationSync
-    MutationSync -->|"PATCH /api/chat/:id"| BackendAPI
-    MutationSync -->|"Invalidate Query Key: chats"| QueryCache
-    QueryCache -->|"Re-render Confirmed State"| UI
+    PromptInput -->|"chat.sendMessageStream()"| GeminiSDK --> GeminiAPI
+    GeminiAPI -->|"Streamed text chunks"| PromptInput
+
+    PromptInput -->|"PATCH /api/chat/:id (save turn)"| ReactQuery
+    ReactQuery -->|"Invalidate ['chats'] cache"| ChatPage
 ```
 
 ---
 
-## 💡 Engineering Highlights & Key Technical Decisions
+## 💡 Key Implementation Details
 
-### 1. Dual-Path Zero-Latency Multimodal Ingestion
-* **The Problem:** In conventional AI web clients, users must wait for an image to fully upload to remote cloud storage before the LLM can receive the image URL and begin generating a response. This introduces noticeable latency (often 1.5–3 seconds of dead wait time).
-* **Engineered Solution:** Designed a bifurcated, parallel ingestion pipeline:
-  1. **Instant UI Feedback:** Generates an ephemeral in-memory URL via `URL.createObjectURL(file)` to render the image preview immediately with zero layout shift.
-  2. **Direct Gemini Vision Stream:** Uses the browser’s `FileReader` API to extract a Base64 binary payload formatted into Gemini’s native `inlineData` structure (`{ mimeType, data }`). This is passed directly into `chat.sendMessageStream()`, enabling inference to start without waiting for third-party uploads.
-  3. **Non-Blocking Persistence:** Concurrently streams the raw file to the Express backend (`POST /api/image`) $\rightarrow$ Cloudinary CDN to acquire an immutable CDN URL for MongoDB storage once the session turn completes.
+### 1. Streaming Responses with `@google/genai`
+Instead of waiting for the full AI response before updating the UI, [`PromptInput.jsx`](./src/components/newPrompt/PromptInput.jsx) uses `chat.sendMessageStream()` and iterates over incoming chunks with a `for await...of` loop. As each chunk arrives, React state is updated and rendered through `react-markdown`:
 
-### 2. High-Throughput Token Streaming with Asynchronous Iterables
-* Rather than waiting for full-body server responses, the client leverages native **ES2018 Async Iterables** (`for await...of`) to consume token chunks emitted by Gemini’s WebSocket/HTTP/2 streaming layer:
-  ```javascript
-  const stream = await chat.sendMessageStream({ message: payload });
-  let accumulated = "";
-  for await (const chunk of stream) {
-    accumulated += chunk.text;
-    setAnswer(accumulated); // Progressive React state re-render
-  }
-  ```
-* Combined with `react-markdown`, formatted responses (headers, markdown tables, lists, and syntax blocks) compile progressively as tokens arrive.
+```javascript
+const stream1 = await chat.sendMessageStream({
+  message: image.aiData ? [image.aiData, text] : text,
+});
+let answerAcc = "";
+setIsLoading(false);
+for await (const chunk of stream1) {
+  answerAcc += chunk.text;
+  setAnswer(answerAcc);
+}
+```
 
-### 3. React 19 StrictMode Concurrency Guard
-* **The Problem:** React 19’s Strict Mode deliberately executes mounting effects twice in development to identify side-effect leaks. When navigating from the Dashboard with an initial prompt, a naive `useEffect` triggers double LLM generations, wasting token quota and generating duplicate answers.
-* **Engineered Solution:** Implemented an explicit execution fence using an un-rendered reference sentinel (`hasRun = useRef(false)`):
-  ```javascript
-  const hasRun = useRef(false);
-  useEffect(() => {
-    if (!hasRun.current) {
-      if (chatHistory?.length === 1) {
-        streamOutput(chatHistory[0]?.parts[0]?.text);
-      }
+### 2. Multi-Turn Context Initialization
+When a user opens an existing chat in [`ChatPage.jsx`](./src/Pages/chatPage/ChatPage.jsx), previous messages are fetched from MongoDB and mapped into the `{ role, parts: [{ text }] }` format expected by `@google/genai`. [`utils/responseGeneration.js`](./utils/responseGeneration.js) initializes the `gemini-2.5-flash` chat session with that history and applies safety settings for harassment and hate speech.
+
+### 3. Handling Images for Both Gemini and MongoDB
+When a user selects an image in [`PromptInput.jsx`](./src/components/newPrompt/PromptInput.jsx) (`handleUpload`):
+1. **Instant Preview:** Creates a local object URL (`URL.createObjectURL(file)`) so the user immediately sees the selected image in the input bar with a loading spinner while it uploads.
+2. **Base64 Encoding for Gemini:** Uses the browser's `FileReader` API to convert the file into Base64 (`inlineData: { data, mimeType }`) so it can be passed directly into `chat.sendMessageStream()`.
+3. **Cloudinary Upload for History:** Uploads the file via `POST /api/image` to Cloudinary (`imageAdd` mutation). If the user clicks the close button before sending, `DELETE /api/image/:id` removes it from Cloudinary. Once the streamed response finishes, the Cloudinary URL is saved alongside the message in MongoDB.
+
+### 4. Preventing Duplicate Calls on New Chats (`useRef` Guard)
+When a user starts a new chat from the Dashboard, the initial message is saved to the database first and the router navigates to `/chat/:id` with `chatHistory.length === 1`. To automatically generate the AI response for that first message without firing twice under React 19's `StrictMode` double-mount in development, a `useRef` flag (`hasRun`) guards the effect:
+
+```javascript
+const hasRun = useRef(false);
+useEffect(() => {
+  if (!hasRun.current) {
+    if (chatHistory?.length == 1) {
+      setIsLoading(true);
+      streamOutput(chatHistory[0]?.parts[0]?.text);
     }
-    hasRun.current = true;
-  }, [chatHistory]);
-  ```
-  Guarantees strict single-execution semantics during concurrent root reconciliation.
+  }
+  hasRun.current = true;
+}, [chatHistory]);
+```
 
-### 4. Declarative Server State Synchronization (TanStack Query v5)
-* Decoupled UI state from raw network requests by relying on TanStack Query:
-  - **Deduplication & Cache Isolation:** Dynamic conversation threads are partitioned under unique query keys (`["chats", id]`), preventing stale cross-chat leaks.
-  - **Predictable Cache Invalidation:** Successful chat appends trigger targeted cache invalidations (`queryClient.invalidateQueries(["chats"])` and `["userChats"]`), maintaining instant consistency between the chat viewport and sidebar directory without manual state prop-drilling.
+### 5. Server State & Cache Invalidation with TanStack Query
+All API calls in [`Api/api.js`](./Api/api.js) are managed through `@tanstack/react-query`:
+* **Sidebar History ([`RecentChats.jsx`](./src/components/RecentChats/RecentChats.jsx)):** Uses `useQuery({ queryKey: ["userChats"] })`. Creating a new chat on the Dashboard invalidates `["userChats"]` so the new thread appears in the sidebar automatically.
+* **Active Chat ([`ChatPage.jsx`](./src/Pages/chatPage/ChatPage.jsx)):** Uses `useQuery({ queryKey: ["chats", id] })`. When a streamed response completes and `PATCH /api/chat/:id` succeeds, invalidating `["chats"]` refreshes the message list from the database and clears the temporary streaming state.
 
-### 5. Architectural Guardrails: Route Isolation & Defensive Auth
-* Implemented nested layout wrappers via `react-router-dom` v7:
-  - **`RootLayout`:** Instantiates top-level context providers (`ContextProvider`, `QueryClientProvider`, `ClerkProvider`) and persistent branding header.
-  - **`DashboardLayout`:** Enforces defensive authentication guards using Clerk's `useAuth()` hook. Unauthenticated sessions are intercepted before component instantiation and redirected to `/login`, while rendering accessible loading fallbacks during token verification.
+### 6. Layout Hierarchy & Protected Routes
+Routing in [`main.jsx`](./src/main.jsx) uses `createBrowserRouter` with two nested layouts:
+* **[`RootLayout.jsx`](./src/Layouts/RootLayout/RootLayout.jsx):** Wraps the application with `ContextProvider`, `QueryClientProvider`, and `ClerkProvider`, and renders the top header.
+* **[`DashboardLayout.jsx`](./src/Layouts/DashboardLayout/DashboardLayout.jsx):** Protects `/dashboard` and `/chat/:id`. It checks `useAuth()` from `@clerk/clerk-react`, shows a Material-UI `CircularProgress` spinner while Clerk loads, and redirects unauthenticated users to `/login`.
 
 ---
 
-## 📂 Project Organization
+## 📂 Folder Structure
 
-```
+```text
 Client/
-├── src/
-│   ├── assets/              # Static vector and image assets
-│   ├── components/
-│   │   ├── chatList/        # Navigation sidebar & route links
-│   │   ├── DashInput/       # Dashboard initial prompt dispatcher
-│   │   ├── newPrompt/       # Core streaming input & media controller (PromptInput.jsx)
-│   │   ├── RecentChats/     # TanStack Query reactive conversation history
-│   │   └── Upload/          # Pure file selector abstraction
-│   ├── context/             # Global React Context provider
-│   ├── Layouts/
-│   │   ├── DashboardLayout/ # Protected layout with auth guard & sidebar split
-│   │   └── RootLayout/      # Root provider tree & global navigation header
-│   ├── Pages/
-│   │   ├── chatPage/        # Dynamic multi-turn chat viewport (/chat/:id)
-│   │   ├── dashboard/       # New chat dashboard & quick suggestion cards
-│   │   ├── homePage/        # Branded marketing landing page with interactive typing demo
-│   │   ├── login/           # Clerk SSO login wrapper
-│   │   └── signUp/          # Clerk signup wrapper
-│   ├── App.css / index.css  # Modern dark-mode stylesheets
-│   └── main.jsx             # React 19 root mount & router hierarchy
-├── utils/
-│   └── responseGeneration.js# Google Gen AI client instantiation & safety policies
 ├── Api/
-│   └── api.js               # Centralized Axios client with credential transmission
-└── vite.config.js           # Vite build pipeline & React plugin configuration
+│   └── api.js                        # Axios instance (withCredentials: true) & API helper functions
+├── src/
+│   ├── assets/                       # Icons, logos, and landing page images
+│   ├── components/
+│   │   ├── chatList/                 # Sidebar navigation links
+│   │   ├── DashInput/                # Prompt input bar for the Dashboard page
+│   │   ├── newPrompt/                # Chat prompt input, image upload & streaming logic
+│   │   ├── RecentChats/              # Fetches and renders user's recent chat links
+│   │   └── Upload/                   # File input button component
+│   ├── context/                      # React Context setup
+│   ├── Layouts/
+│   │   ├── DashboardLayout/          # Auth check wrapper + sidebar layout
+│   │   └── RootLayout/               # Providers (Clerk, React Query) + top navbar
+│   ├── Pages/
+│   │   ├── chatPage/                 # Conversation view (/chat/:id)
+│   │   ├── dashboard/                # New chat creation page (/dashboard)
+│   │   ├── homePage/                 # Landing page (/) with react-type-animation
+│   │   ├── login/                    # Clerk <SignIn /> page (/login/*)
+│   │   └── signUp/                   # Clerk <SignUp /> page (/signUp/*)
+│   └── main.jsx                      # App entry point & router configuration
+├── utils/
+│   └── responseGeneration.js         # GoogleGenAI setup & gemini-2.5-flash config
+├── .env.example                      # Environment variable template
+├── package.json
+└── vite.config.js
 ```
 
 ---
 
-## ⚡ Performance & UX Optimizations
+## ⚙️ Environment Variables
 
-| Feature | Implementation | Engineering Benefit |
-| :--- | :--- | :--- |
-| **Smooth Viewport Anchoring** | `ref.current.scrollIntoView({ behavior: "smooth" })` bound to `[answer, prompt]` | Keeps user viewport locked to the emerging text stream without jank. |
-| **Interactive Landing Animation** | `react-type-animation` cycling queries and dynamic bot/human avatar swap | Delivers high-polish user onboarding with minimal JS bundle overhead. |
-| **Credentialed Transport** | `axios.create({ withCredentials: true })` | Automatically passes secure HTTP-only Clerk session cookies across CORS boundaries. |
-| **Accessible State Fallbacks** | Material-UI `CircularProgress` with semantic contrast | Prevents flash of unstyled content (FOUC) while auth state resolves. |
-
----
-
-## ⚙️ Environment Configuration
-
-Create an `.env` file in the `Client/` directory:
+Create an `.env` file in the `Client/` directory (see [`.env.example`](./.env.example)):
 
 ```ini
-# Clerk Authentication
 VITE_CLERK_PUBLISHABLE_KEY=pk_test_...
-
-# Express Backend Service URL
 VITE_API_URI=http://localhost:8000
-
-# Google Gemini API Key
 VITE_GEMINI_API_KEY=AIzaSy...
 ```
 
 ---
 
-## 🚀 Getting Started
+## 🚀 Running Locally
 
-### Prerequisites
-* Node.js v18.x or later
-* Active Clerk application with publishable key
-* Google AI Studio API key
-
-### Installation & Development
 ```bash
 # Install dependencies
 npm install
 
-# Start Vite HMR development server
+# Start Vite dev server (http://localhost:5173)
 npm run dev
 
-# Type-check & build for production
+# Build for production
 npm run build
 
-# Preview production build locally
+# Preview production build
 npm run preview
 ```
 
 ---
+
+## 🔧 Next Steps & Planned Improvements
+
+* **Move Gemini SDK Calls to the Backend:** Currently `VITE_GEMINI_API_KEY` is called from the browser for direct streaming. Moving this to a backend streaming endpoint will keep the API key private.
+* **Support Image Upload on Initial Dashboard Prompt:** Extend `DashboardInput.jsx` so images selected on `/dashboard` are uploaded and included in the first message of a new chat, matching `PromptInput.jsx`.
+* **Include Previous Images in Multi-Turn History:** Pass historical image data (or file references) when initializing `getAiChat(chatHistory)` so follow-up questions can reference images from earlier turns.

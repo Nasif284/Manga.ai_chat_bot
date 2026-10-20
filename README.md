@@ -1,4 +1,4 @@
-# Manga.ai — Full-Stack Multimodal AI Chatbot Platform
+# Manga.ai — Full-Stack AI Chatbot
 
 [![React 19](https://img.shields.io/badge/React-19-blue.svg)](https://react.dev/)
 [![Express 5](https://img.shields.io/badge/Express-5.x-green.svg)](https://expressjs.com/)
@@ -7,103 +7,94 @@
 [![Google Gen AI](https://img.shields.io/badge/Google%20Gen%20AI-Gemini%202.5%20Flash-orange.svg)](https://ai.google.dev/)
 [![Clerk](https://img.shields.io/badge/Auth-Clerk-blueviolet.svg)](https://clerk.com/)
 
-A modern, production-structured conversational AI web application featuring **real-time token streaming**, **zero-latency multimodal image analysis**, **atomic conversation synchronization**, and **zero-trust identity verification**.
+A full-stack AI chatbot application built with **React 19**, **Express 5**, **MongoDB**, **Clerk**, **Cloudinary**, and **Google Gemini (`gemini-2.5-flash`)**. Users can sign in, start multi-turn conversations, upload images for visual Q&A, receive streamed Markdown responses in real time, and revisit their past chats from the sidebar.
 
 ---
 
-## 🏛️ System Architecture Overview
+## 🔄 End-to-End Application Flow
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor User as User Browser
-    participant Client as React 19 Client (:5173)
-    participant Clerk as Clerk Identity
-    participant Gemini as Google Gemini 2.5 Flash
-    participant API as Express 5 Backend (:8000)
+    actor User as User
+    participant Client as React Client (:5173)
+    participant API as Express Server (:8000)
     participant Cloudinary as Cloudinary CDN
-    participant Mongo as MongoDB Cluster
+    participant Gemini as Google Gemini 2.5 Flash
+    participant Mongo as MongoDB
 
-    User->>Client: Enters prompt + attaches image
-    Client->>Client: Creates instant local Blob preview (URL.createObjectURL)
-    
-    par Dual-Path Ingestion
-        Client->>API: POST /api/image (multipart/form-data)
-        API->>Cloudinary: Stream upload to 'chat-bot' folder
-        API-->>Client: Returns { url, public_id }
-    and Direct AI Streaming
-        Client->>Gemini: chat.sendMessageStream(inlineData + prompt)
-        loop Real-Time Chunk Streaming
-            Gemini-->>Client: Emits token chunk
-            Client->>User: Progressively renders Markdown
-        end
+    User->>Client: Selects an image in chat input
+    Client->>Client: Shows local preview (URL.createObjectURL) & encodes Base64 (FileReader)
+    Client->>API: POST /api/image (multipart/form-data)
+    API->>Cloudinary: Uploads temp file & deletes local copy (fs.unlinkSync)
+    API-->>Client: Returns Cloudinary { url, public_id }
+
+    User->>Client: Submits prompt
+    Client->>Gemini: chat.sendMessageStream([inlineData, text])
+    loop Streaming Response
+        Gemini-->>Client: Yields text chunk
+        Client->>User: Renders live Markdown
     end
 
-    Client->>API: PATCH /api/chat/:id (Atomic MongoDB push operation)
-    API->>Mongo: Persists conversation turn with Cloudinary media URL
+    Client->>API: PATCH /api/chat/:id (user prompt + AI answer + Cloudinary URL)
+    API->>Mongo: Appends turn via $push & $each
     API-->>Client: 200 OK
-    Client->>Client: Invalidate TanStack Query cache (Syncs sidebar)
+    Client->>Client: Invalidates TanStack Query ['chats'] cache
 ```
 
 ---
 
-## 📂 Repository Structure
+## 📂 Project Structure
 
-The project is architected as an isolated full-stack system with dedicated documentation for both tiers:
+This repository is split into two folders, each with its own detailed README:
 
-| Subsystem | Tech Stack | Documentation |
+| Folder | Tech Stack | Documentation |
 | :--- | :--- | :--- |
-| **`Client/`** | React 19, Vite 7, TanStack Query v5, `@google/genai`, Clerk React, React Router 7 | **[Client Documentation ➔](./Client/README.md)** |
-| **`Api/`** | Node.js (ESM), Express 5, Mongoose 8, Clerk Express, Cloudinary, Multer | **[Backend Service Documentation ➔](./Api/README.md)** |
+| **[`Client/`](./Client)** | React 19, Vite 7, TanStack Query v5, `@google/genai`, Clerk React, React Router v7 | **[Read Client README ➔](./Client/README.md)** |
+| **[`Api/`](./Api)** | Node.js (ESM), Express 5, Mongoose 8, `@clerk/express`, Cloudinary, Multer | **[Read Backend README ➔](./Api/README.md)** |
 
 ---
 
-## ⚡ Key Engineering Highlights
+## ⚡ Key Features & Technical Choices
 
-* **Dual-Path Multimodal Pipeline:** Eliminates cloud-upload wait times by directly piping Base64 `inlineData` to Gemini's vision engine while asynchronously persisting the binary file to Cloudinary in the background.
-* **Non-Blocking Token Streaming:** Consumes asynchronous chunk streams (`for await...of`) to render tokens progressively without blocking the React 19 fiber reconciliation loop.
-* **Document Partitioning (16MB BSON Protection):** Separates indexed directory metadata (`userChats`) from individual conversational records (`chat`) to guarantee `O(1)` history lookups and eliminate MongoDB 16MB document size caps.
-* **Atomic Concurrency Control:** Employs MongoDB’s `$push` with `$each` to commit multi-turn conversations in a single round-trip without write-conflict locks.
-* **Strict Mode Concurrency Guard:** Uses un-rendered reference sentinels (`useRef`) to protect against duplicate AI generations under React 19 Concurrent Mode lifecycle mounting.
-* **Zero-Trust Identity Boundary:** Decoupled session verification via Clerk middleware at both edge ingress and database access layers.
+* **Real-Time Response Streaming:** Uses `@google/genai`'s `sendMessageStream()` with an async `for await...of` loop to progressively render Markdown (`react-markdown`) and auto-scroll as chunks arrive.
+* **Multimodal Image Support:** Converts user-selected images into Base64 (`FileReader`) for Gemini's multimodal input while uploading the file via Multer to Cloudinary (`POST /api/image`) so the permanent image URL can be stored in MongoDB. Users can also remove an uploaded image before sending (`DELETE /api/image/:id`).
+* **Two-Collection MongoDB Design:** Separates lightweight sidebar history (`userChats` storing `{ chat_id, title }`) from full conversation threads (`chat` storing `{ role, text, image }` arrays) so loading the sidebar doesn't fetch every message of every chat.
+* **Direct Array Appends in MongoDB:** Uses Mongoose `findByIdAndUpdate` with `$push: { chat: { $each: body } }` to append new messages without reading and rewriting the entire conversation document.
+* **Server State Management with TanStack Query:** Caches chat history (`["userChats"]`) and individual conversations (`["chats", id]`), automatically updating the UI via `invalidateQueries` after mutations.
+* **Authentication with Clerk:** Protects `/dashboard` and `/chat/:id` routes on the frontend via `DashboardLayout` and identifies users on the backend via `@clerk/express` (`clerkMiddleware()` and `getAuth(req)`).
 
 ---
 
 ## 🛠️ Quickstart
 
 ### Prerequisites
-* **Node.js** $\ge$ v18.0.0
-* **MongoDB** connection string
-* **Clerk** application keys
-* **Cloudinary** credentials
-* **Google Gemini API** key
+* **Node.js** v18+
+* **MongoDB** URI (local or MongoDB Atlas)
+* **Clerk** Publishable & Secret keys
+* **Cloudinary** Cloud Name, API Key & Secret
+* **Google Gemini** API Key
 
-### 1. Backend Service Setup
+### 1. Start the Backend (`Api/`)
 ```bash
 cd Api
 npm install
 
-# Configure environment
-cp .env.example .env # or create .env with required keys
+# Copy the example env file and fill in your keys
+cp .env.example .env
 
-# Run development server (Port 8000)
+# Start development server on http://localhost:8000
 npm run dev
 ```
 
-### 2. Frontend Client Setup
+### 2. Start the Frontend (`Client/`)
 ```bash
 cd Client
 npm install
 
-# Configure environment
-cp .env.example .env # or create .env with required keys
+# Copy the example env file and fill in your keys
+cp .env.example .env
 
-# Run Vite dev server (Port 5173)
+# Start Vite dev server on http://localhost:5173
 npm run dev
 ```
-
----
-
-## 📖 Deep Dives
-* For API route specifications, Mongoose schemas, and server error handling, read **[`Api/README.md`](./Api/README.md)**.
-* For streaming logic, TanStack Query caching strategy, and layout guards, read **[`Client/README.md`](./Client/README.md)**.

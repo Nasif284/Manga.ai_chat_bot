@@ -1,273 +1,189 @@
-# Manga.ai Backend Core Service
+# Manga.ai — Backend API (`Api/`)
 
-An asynchronous, distributed-ready REST backend service built with **Node.js**, **Express 5**, **MongoDB/Mongoose**, **Clerk Auth**, and **Cloudinary**. Engineered for high-throughput conversation persistence, zero-trust session validation, and atomic media-metadata lifecycle management.
+REST API built with **Node.js (ES Modules)**, **Express 5**, and **MongoDB (Mongoose)** for the Manga.ai chatbot application. It manages user chat history, conversation messages, Clerk session authentication, and image uploads via **Multer** and **Cloudinary**.
 
 ---
 
-## 🏗️ System Architecture
-
-The service operates as a stateless RESTful application tier responsible for conversation state synchronization, user chat indexing, and media processing.
+## 🏗️ Backend Architecture & Request Flow
 
 ```mermaid
 flowchart TD
-    subgraph ClientTier ["Client Tier"]
-        Client["Client SPA / Mobile"]
+    Client["React Client (:5173)"]
+
+    subgraph ExpressApp ["Express 5 Server (:8000)"]
+        Middleware["Middlewares\nCORS + Morgan + express.json + clerkMiddleware"]
+        Router["API Routes"]
+        Multer["Multer Disk Storage\n(/uploads temp folder)"]
+        Controller["Chat Controller\n(chat.controller.js)"]
+        ErrorHandler["Global Error Handler\n(asyncHandler + errorHandler)"]
     end
 
-    subgraph SecurityIngress ["Security & Ingress"]
-        LB["Reverse Proxy / Ingress"]
-        CORS["CORS Guard\nStrict Origin & Credentials"]
-        ClerkMW["Clerk Authentication Guard\nJWT Verification"]
+    subgraph ExternalServices ["Database & Cloud Storage"]
+        MongoDB[("(MongoDB / Mongoose)")]
+        Cloudinary[("(Cloudinary CDN)")]
     end
 
-    subgraph ServiceTier ["Service Tier (Express 5 Engine)"]
-        Router["API Route Ingress"]
-        MulterPipe["Multer Ephemeral Buffer\n/uploads"]
-        ChatCtrl["Chat & Session Controller"]
-        MediaCtrl["Cloudinary Media Manager"]
-        ErrMW["Centralized Error Pipeline"]
-    end
+    Client -->|"HTTP Request (withCredentials)"| Middleware
+    Middleware --> Router
 
-    subgraph DataStorage ["Data & Storage Layer"]
-        Mongo[("(MongoDB Cluster / Mongoose)")]
-        CDN[("(Cloudinary Media CDN)")]
-    end
+    Router -->|"POST /api/image"| Multer
+    Multer --> Controller
+    Controller -->|"Upload image"| Cloudinary
+    Controller -->|"fs.unlinkSync (delete temp file)"| Multer
 
-    Client -->|"Bearer JWT + Request"| LB
-    LB --> CORS
-    CORS --> ClerkMW
-    ClerkMW --> Router
+    Router -->|"Chat & History Routes"| Controller
+    Controller -->|"Mongoose Queries"| MongoDB
 
-    Router -->|"POST /api/image"| MulterPipe
-    MulterPipe --> MediaCtrl
-    MediaCtrl -->|"Upload Stream"| CDN
-    MediaCtrl -->|"Local Cleanup (fs.unlink)"| MulterPipe
-
-    Router -->|"Session / History Queries"| ChatCtrl
-    ChatCtrl -->|"Read / Atomic Write"| Mongo
-
-    ChatCtrl -.->|"Unhandled Exceptions"| ErrMW
-    MediaCtrl -.->|"Unhandled Exceptions"| ErrMW
-    ErrMW -->|"Standardized Error JSON"| Client
+    Controller -.->|"Caught by asyncHandler"| ErrorHandler
+    ErrorHandler -->|"Error JSON Response"| Client
 ```
 
 ---
 
-## 💡 Engineering Highlights & Design Decisions
+## 💡 Key Implementation Details
 
-### 1. Document Partitioning Strategy (Mitigating the 16MB BSON Limit)
-* **Problem:** In conversational applications, naively embedding all message logs inside the user's primary document leads to rapid document bloat, poor I/O latency, and eventually breaches MongoDB’s **16MB BSON document size constraint**.
-* **Engineered Solution:** Separated into a decoupled two-collection design:
-  - **`userChats` Collection:** Acts as an indexed lightweight metadata directory (`userId`, `chat_id`, `title`, and `timestamps`). Querying user history requires minimal memory overhead (`O(1)` document lookup without fetching megabytes of raw message history).
-  - **`chat` Collection:** Dedicated conversation document indexed by `_id` and isolated per thread, storing the chronological interaction turns.
+### 1. Separate Collections for Sidebar History and Chat Messages
+Instead of storing every conversation and all its messages inside a single user document, the database schema is split into two Mongoose models:
+* **`userChats` ([`models/userChats.model.js`](./models/userChats.model.js)):** Stores only the user's `userId` and a lightweight array of `{ chat_id, title }`. When the frontend loads the sidebar (`GET /api/history`), it only fetches titles and IDs instead of pulling the full text of every past conversation.
+* **`chat` ([`models/chat.model.js`](./models/chat.model.js)):** Stores the full array of `{ role, text, image }` messages for a single conversation thread, fetched only when the user opens `/chat/:id`.
 
-### 2. Atomic Conversation Append with Concurrency Control
-* To preserve message sequencing and prevent race conditions when client state revalidates:
-  - Utilizes MongoDB's `$push` with the `$each` modifier to perform atomic batch writes in a single round-trip:
-    ```javascript
-    await chatModel.findByIdAndUpdate(id, { $push: { chat: { $each: body } } });
-    ```
-  - Eliminates the need for client-side locking or expensive read-modify-write transactions for sequential message turns.
+### 2. Appending Messages with MongoDB `$push` and `$each`
+When a conversation turn finishes on the frontend, `PATCH /api/chat/:id` appends both the user prompt and the AI response in a single database update rather than fetching the whole document into memory and re-saving it:
+```javascript
+export const addChat = async (req, res) => {
+  const id = req.params.id;
+  const body = req.body;
+  await chatModel.findByIdAndUpdate(id, { $push: { chat: { $each: body } } });
+  return res.status(200).json({ success: true, error: false });
+};
+```
 
-### 3. Ephemeral Buffer & Garbage-Collected Media Pipeline
-* **Two-Phase Upload Lifecycle:**
-  1. Files are intercepted by Multer into an isolated ephemeral local storage directory (`/uploads`) with a collision-resistant timestamp-entropy suffix (`Date.now() + Math.random()`).
-  2. The buffer is uploaded to Cloudinary's global CDN inside the dedicated `chat-bot` namespace.
-  3. **Synchronous File System Cleanup:** The local temp artifact is immediately unlinked (`fs.unlinkSync`) in the same execution cycle, preventing disk exhaustion and dangling file descriptors under high concurrency.
+### 3. Image Upload & Local Temp File Cleanup
+Image uploads (`POST /api/image`) use a two-step flow:
+1. **Multer ([`Middlewares/multer.js`](./Middlewares/multer.js))** saves the incoming `multipart/form-data` file temporarily to the local `uploads/` folder with a unique timestamp prefix (`Date.now() + "-" + Math.round(Math.random() * 1e9)`).
+2. **`uploadImage` ([`Controllers/chat.controller.js`](./Controllers/chat.controller.js))** uploads the file to Cloudinary under the `chat-bot` folder, immediately removes the local temporary file using `fs.unlinkSync(image.path)` to keep the `uploads/` folder clean, and returns the Cloudinary `url` and `public_id`.
 
-### 4. Zero-Trust Identity Integration
-* Authentication is delegated to **Clerk** at the middleware boundary via `@clerk/express`.
-* The server verifies the cryptographically signed session tokens and injects verified identity claims (`userId`) via `getAuth(req)`. Unauthenticated or forged requests are rejected before ever hitting the business logic or database layers.
+### 4. Centralized Async Error Handling
+All route controllers are wrapped with [`asyncHandler.js`](./Middlewares/asyncHandler.js):
+```javascript
+export const asyncHandler = (func) => (req, res, next) =>
+  Promise.resolve(func(req, res)).catch(next);
+```
+Any database or Cloudinary error thrown inside an `async` controller is automatically passed to [`globalErrorHandler.js`](./Middlewares/globalErrorHandler.js), which logs the error stack and returns a consistent JSON response.
 
-### 5. Resilient Error Propagation & Express 5 Modern Pipeline
-* Express 5 brings native asynchronous error handling, augmented by an explicit `asyncHandler` higher-order wrapper ensuring all rejected promises seamlessly route to the centralized `globalErrorHandler`.
-* Prevents unhandled promise rejections from terminating the Node.js event loop, returning consistent error schemas across all API endpoints.
+### 5. Clerk Authentication Integration
+The server uses `@clerk/express` (`clerkMiddleware()`) along with `cors({ origin: process.env.FRONTEND_URI, credentials: true })` to read Clerk session cookies sent from the React frontend and extract the logged-in `userId` via `getAuth(req)`.
 
 ---
 
-## 🗄️ Database Schemas & Data Model
+## 🗄️ Database Schema
 
 ```mermaid
 erDiagram
     userChats {
         ObjectId _id PK
-        String userId "Indexed Clerk User ID"
+        String userId "Clerk User ID"
         Array chats "List of user conversations"
         Date createdAt
         Date updatedAt
     }
 
-    userChats ||--o{ chat_reference : contains
-    chat_reference {
+    userChats ||--o{ chat_item : contains
+    chat_item {
         ObjectId chat_id FK "References chat._id"
-        String title "Truncated snippet (max 40 chars)"
+        String title "First 40 chars of initial prompt"
     }
 
     chat {
         ObjectId _id PK
         String userid "Clerk User ID"
-        Array chat "Chronological interaction turns"
+        Array chat "Conversation messages"
     }
 
     chat ||--o{ message : contains
     message {
-        String role "Enum user or model"
-        String text "Message content or Markdown"
-        String image "Optional Cloudinary CDN URL"
+        String role "user or model"
+        String text "Message text / Markdown"
+        String image "Optional Cloudinary URL"
     }
 ```
 
 ---
 
-## 📡 REST API Specification
+## 📂 Folder Structure
 
-### Authentication
-All protected routes require an active Clerk session cookie or header verified via `clerkMiddleware()`.
-
----
-
-### `POST /api/chat/new`
-Initializes a new conversation thread and registers the thread reference in the user's directory.
-
-* **Request Body:**
-  ```json
-  {
-    "text": "Explain quantum computing fundamentals",
-    "image": "https://res.cloudinary.com/.../image.jpg" // optional
-  }
-  ```
-* **Response `(200 OK)`:**
-  ```json
-  {
-    "success": true,
-    "error": false,
-    "id": "670c5b369c4a8a5f33d4e891",
-    "message": "Chat saved"
-  }
-  ```
+```text
+Api/
+├── Config/
+│   └── dbConnect.js             # Mongoose connection setup
+├── Controllers/
+│   └── chat.controller.js       # Route handlers for chats, history, and images
+├── Middlewares/
+│   ├── asyncHandler.js          # Promise wrapper for async route handlers
+│   ├── globalErrorHandler.js    # Express error-handling middleware
+│   └── multer.js                # Multer diskStorage configuration
+├── models/
+│   ├── chat.model.js            # Schema for individual conversation messages
+│   └── userChats.model.js       # Schema for a user's list of chats
+├── uploads/                     # Temporary folder for Multer uploads
+├── .env.example                 # Environment variable template
+├── package.json
+└── server.js                    # Express app entry point & route definitions
+```
 
 ---
 
-### `GET /api/chat/:id`
-Fetches the full conversation message history for a specific thread ID.
+## 📡 API Endpoints
 
-* **URL Parameters:** `id` (MongoDB ObjectId)
-* **Response `(200 OK)`:**
-  ```json
-  {
-    "chats": [
-      {
-        "role": "user",
-        "text": "Explain quantum computing fundamentals",
-        "_id": "670c5b369c4a8a5f33d4e892"
-      },
-      {
-        "role": "model",
-        "text": "Quantum computing is a rapidly-emerging technology...",
-        "_id": "670c5b379c4a8a5f33d4e893"
-      }
-    ]
-  }
-  ```
+| Method | Endpoint | Description |
+| :--- | :--- | :--- |
+| `POST` | `/api/chat/new` | Creates a new chat document and adds its ID & title (first 40 chars) to `userChats`. |
+| `GET` | `/api/chat/:id` | Returns the `chats` message array for a specific conversation ID. |
+| `PATCH` | `/api/chat/:id` | Appends an array of new message objects (`{ role, text, image }`) to an existing chat. |
+| `GET` | `/api/history` | Returns the `userChats` document for the currently authenticated Clerk user. |
+| `POST` | `/api/image` | Uploads an image file (`multipart/form-data`, field `image`) to Cloudinary and deletes the local temp file. |
+| `DELETE` | `/api/image/:id` | Deletes an uploaded image from the `chat-bot/` folder in Cloudinary by its ID. |
 
 ---
 
-### `PATCH /api/chat/:id`
-Appends one or more conversation turns to an existing chat document.
+## ⚙️ Environment Variables
 
-* **URL Parameters:** `id` (MongoDB ObjectId)
-* **Request Body:** Array of message objects
-  ```json
-  [
-    {
-      "role": "user",
-      "text": "Can you elaborate on superposition?"
-    },
-    {
-      "role": "model",
-      "text": "Superposition is a principle of quantum mechanics..."
-    }
-  ]
-  ```
-* **Response `(200 OK)`:**
-  ```json
-  {
-    "success": true,
-    "error": false
-  }
-  ```
+Create an `.env` file in the `Api/` directory (see [`.env.example`](./.env.example)):
+
+```ini
+FRONTEND_URI=http://localhost:5173
+MONGODB_URi=mongodb+srv://<username>:<password>@cluster.mongodb.net/chatbot
+
+# Clerk Auth
+CLERK_PUBLISHABLE_KEY=pk_test_...
+CLERK_SECRET_KEY=sk_test_...
+
+# Cloudinary
+CLOUD_NAME=your_cloud_name
+CLOUD_API_KEY=your_cloudinary_api_key
+CLOUD_SECRETE_KEY=your_cloudinary_api_secret
+```
 
 ---
 
-### `GET /api/history`
-Retrieves all historical chat sessions for the authenticated user to populate sidebar navigation.
+## 🚀 Running Locally
 
-* **Response `(200 OK)`:**
-  ```json
-  {
-    "userChats": {
-      "_id": "670c5aa19c4a8a5f33d4e88f",
-      "userId": "user_2nAbC...",
-      "chats": [
-        {
-          "chat_id": "670c5b369c4a8a5f33d4e891",
-          "title": "Explain quantum computing fundamentals",
-          "_id": "670c5b369c4a8a5f33d4e894"
-        }
-      ],
-      "createdAt": "2026-10-14T06:30:00.000Z",
-      "updatedAt": "2026-10-14T06:35:12.000Z"
-    }
-  }
-  ```
-
----
-
-### `POST /api/image`
-Uploads a binary image file via `multipart/form-data`, persists it to Cloudinary, and removes local disk caches.
-
-* **Headers:** `Content-Type: multipart/form-data`
-* **Form Field:** `image: File`
-* **Response `(200 OK)`:**
-  ```json
-  {
-    "url": "https://res.cloudinary.com/demo/image/upload/v1234567890/chat-bot/sample.png",
-    "public_id": "chat-bot/sample"
-  }
-  ```
-
----
-
-### `DELETE /api/image/:id`
-Deletes an uploaded image asset from Cloudinary storage.
-
-* **URL Parameters:** `id` (Asset public ID)
-* **Response `(200 OK)`:**
-  ```json
-  {
-    "success": true
-  }
-  ```
-
----
-
-## 🚀 Getting Started
-
-### Prerequisites
-* Node.js v18.x or later
-* Active MongoDB connection URI
-* Cloudinary and Clerk developer accounts
-
-### Installation & Execution
 ```bash
 # Install dependencies
 npm install
 
-# Start development server with hot-reload (Nodemon)
+# Run in development mode with nodemon (runs on port 8000)
 npm run dev
 
-# Start production server
+# Run in production mode
 npm start
 ```
 
 ---
+
+## 🔧 Next Steps & Planned Improvements
+
+* **Strict Route Ownership Checks:** Enforce Clerk's `requireAuth()` middleware across all routes and verify that `chat.userid === userId` inside `getChats` and `addChat` so users can only access their own conversations.
+* **Database Indexing:** Add `{ index: true }` on `userId` in `userChats.model.js` for faster queries as the user base grows.
+* **Move Gemini Calls to the Backend:** Proxy Gemini streaming through an Express Server-Sent Events (SSE) endpoint so the Gemini API key stays strictly on the server.
+* **Safe Temp File Cleanup:** Move `fs.unlinkSync` into a `try / finally` block so temporary files in `uploads/` are deleted even if a Cloudinary upload fails.
